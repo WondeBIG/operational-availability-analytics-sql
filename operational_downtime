@@ -1,0 +1,136 @@
+WITH date_range AS (
+    -- Generate a list of dates up to the current date
+    SELECT 
+        date_day AS report_date
+    FROM 
+        analytics.date_dimension
+    WHERE 
+        date_day <= CURRENT_DATE()
+    ORDER BY 
+        date_day DESC
+),
+active_facilities AS (
+    -- Retrieve unique active facility IDs and names
+    SELECT DISTINCT 
+        facility_id,
+        facility_name,
+        country
+    FROM 
+        analytics.dim_facilities
+    WHERE 
+        is_active = TRUE
+),
+date_facility_combinations AS (
+    -- Create a cross join to get all date-facility combinations
+    SELECT 
+        d.report_date,
+        f.facility_id,
+        f.facility_name,
+        f.country
+    FROM 
+        date_range d
+    CROSS JOIN 
+        active_facilities f
+),
+downtime_events AS (
+    -- Aggregate downtime events by date and facility
+    SELECT 
+        DATE_TRUNC('day', dte.event_start_time) AS event_date,
+        dte.facility_id,
+        dte.country,
+        CASE 
+            WHEN dte.category ILIKE 'Scheduled%' THEN 'Planned Downtime'
+            WHEN dte.category ILIKE 'Operations' THEN 'Planned Downtime'
+            ELSE 'Unplanned Downtime'
+        END AS downtime_type,
+        COUNT(DISTINCT dte.downtime_id) AS total_events,
+        SUM(CASE WHEN pkg.priority = 'resupply' THEN 1 ELSE 0 END) AS resupply_packages,
+        SUM(CASE WHEN pkg.priority = 'scheduled' THEN 1 ELSE 0 END) AS scheduled_packages,
+        SUM(CASE WHEN pkg.priority = 'emergency' THEN 1 ELSE 0 END) AS emergency_packages,
+        SUM(CASE WHEN pkg.priority IN ('asap', 'standard') THEN 1 ELSE 0 END) AS other_packages,
+        SUM(EXTRACT(EPOCH FROM (dte.event_end_time - dte.event_start_time))) AS total_duration_seconds
+    FROM 
+        analytics.fact_downtime_events dte
+    LEFT JOIN 
+        analytics.fact_packages_affected pkg 
+        ON dte.downtime_id = pkg.downtime_id
+    WHERE 
+        dte.category != 'Call Centre'
+    GROUP BY 
+        event_date, dte.facility_id, dte.country, downtime_type
+),
+aggregated_downtime AS (
+    -- Summarize downtime data per facility and day, adding calculated fields
+    SELECT 
+        event_date,
+        facility_id,
+        country,
+        downtime_type,
+        SUM(total_events) AS total_events,
+        SUM(resupply_packages) AS resupply_packages,
+        SUM(scheduled_packages) AS scheduled_packages,
+        SUM(emergency_packages) AS emergency_packages,
+        SUM(other_packages) AS other_packages,
+        SUM(total_duration_seconds) AS total_duration_seconds,
+
+        -- Calculated field: Total affected packages
+        SUM(resupply_packages + scheduled_packages + emergency_packages + other_packages) AS total_affected_packages,
+
+        -- Calculated field: Operational hours in seconds per facility (24 hours per day)
+        COUNT(DISTINCT event_date) * 24 * 60 * 60 AS operational_hrs_sec
+
+    FROM 
+        downtime_events
+    GROUP BY 
+        event_date, facility_id, country, downtime_type
+),
+aggregated_country AS (
+    -- Aggregate operational hours and uptime per country
+    SELECT 
+        country,
+        SUM(operational_hrs_sec) AS country_operational_hrs
+    FROM 
+        aggregated_downtime
+    GROUP BY 
+        country
+)
+SELECT 
+    dfc.report_date,
+    dfc.facility_name,
+    dfc.country,
+    COALESCE(ad.downtime_type, 'No Downtime') AS downtime_type,
+    COALESCE(ad.total_events, 0) AS total_events,
+    COALESCE(ad.resupply_packages, 0) AS resupply_packages,
+    COALESCE(ad.scheduled_packages, 0) AS scheduled_packages,
+    COALESCE(ad.emergency_packages, 0) AS emergency_packages,
+    COALESCE(ad.other_packages, 0) AS other_packages,
+    COALESCE(ad.total_duration_seconds, 0) AS total_duration_seconds,
+
+    -- Bringing in calculated fields
+    COALESCE(ad.total_affected_packages, 0) AS total_affected_packages,
+    COALESCE(ad.operational_hrs_sec, 86400) AS operational_hrs_sec,  -- Default to 24 hours per facility
+    COALESCE(ac.country_operational_hrs, 86400) AS country_operational_hrs,  -- Default to 24 hours per facility
+
+    -- Uptime calculations
+    (COALESCE(ad.operational_hrs_sec, 86400) - COALESCE(ad.total_duration_seconds, 0)) / 3600 AS uptime_hours,
+    1 - (COALESCE(ad.total_duration_seconds, 0) / COALESCE(ad.operational_hrs_sec, 86400)) AS nest_uptime_percent,
+    1 - (COALESCE(ad.total_duration_seconds, 0) / COALESCE(ac.country_operational_hrs, 86400)) AS country_uptime_percent,
+
+    -- Downtime formatted in hh:mm:ss
+    CONCAT(
+        LPAD(FLOOR(COALESCE(ad.total_duration_seconds, 0) / 3600)::TEXT, 2, '0'), 'h:',
+        LPAD(FLOOR((COALESCE(ad.total_duration_seconds, 0) / 60) % 60)::TEXT, 2, '0'), 'm:',
+        LPAD((COALESCE(ad.total_duration_seconds, 0) % 60)::TEXT, 2, '0'), 's'
+    ) AS downtime_duration_hhmm
+
+FROM 
+    date_facility_combinations dfc
+LEFT JOIN 
+    aggregated_downtime ad 
+    ON dfc.report_date = ad.event_date 
+    AND dfc.facility_id = ad.facility_id
+LEFT JOIN 
+    aggregated_country ac 
+    ON dfc.country = ac.country
+ORDER BY 
+    dfc.report_date DESC, dfc.facility_name, dfc.country
