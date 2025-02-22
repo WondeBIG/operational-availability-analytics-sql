@@ -1,0 +1,53 @@
+WITH delivery_details AS (
+    -- Extract delivery, order, and regulatory-related constraints
+    SELECT 
+        DATE_TRUNC('day', d.order_confirmed_at) AS report_date,
+        d.package_committed_at,
+        d.flight_launched_at,
+        
+        -- Calculated Fields: Delays
+        DATEDIFF(MINUTE, d.package_committed_at, d.flight_launched_at) AS launch_delay,
+        DATEDIFF(MINUTE, d.order_confirmed_at, d.delivery_completed_at) AS order_delay,
+        
+        -- Key Identifiers
+        d.flight_id,
+        o.facility_name AS health_facility,
+        d.hub_id,
+        h.hub_name AS hub,
+        o.order_id,
+        o.off_nominal_event AS order_off_nominal,
+        o.off_nominal_reason AS order_off_nominal_reason,
+        o.off_nominal_category AS order_category,
+        o.order_comments,
+        o.additional_comments AS nod_order_comments,
+        f.off_nominal_event AS flight_off_nominal,
+        f.off_nominal_category AS flight_category,
+        d.package_id,
+        d.shipment_priority
+
+    FROM 
+        analytics.deliveries d
+    JOIN 
+        analytics.orders o 
+        ON o.hub_id = d.hub_id 
+        AND o.order_key = d.order_key
+    LEFT JOIN 
+        analytics.flight_disruptions f 
+        ON f.hub_id = d.hub_id 
+        AND d.flight_id = f.flight_id
+    LEFT JOIN 
+        analytics.order_disruptions o_disruptions 
+        ON o_disruptions.hub_id = d.hub_id 
+        AND o_disruptions.order_id = o.order_id
+    LEFT JOIN 
+        analytics.dim_hubs h 
+        ON h.hub_id = d.hub_id
+    WHERE 
+        (o_disruptions.off_nominal_category = 'Regulatory' 
+        OR f.off_nominal_category = 'Regulatory') 
+        AND d.order_confirmed_at BETWEEN DATEADD('Year', -1, CURRENT_DATE()) AND CURRENT_DATE()
+)
+-- Final Query: Retrieve All Regulatory-Affected Deliveries
+SELECT *
+FROM delivery_details
+ORDER BY report_date DESC NULLS LAST;
