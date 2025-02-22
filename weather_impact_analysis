@@ -1,0 +1,129 @@
+WITH weather_conditions AS (
+    -- Identify periods where wind speed forecasts exceeded the 15m/s threshold
+    SELECT 
+        DATE_TRUNC('hour', recorded_at) AS report_day,
+        facility_name,
+        facility_id,
+        hub_name AS hub,
+        w.hub_id,
+        MAX(wind_speed_mps) AS max_wind_speed,
+        DATEDIFF(
+            seconds, 
+            MIN(recorded_at), 
+            TIMESTAMPADD(MINUTE, 15, MAX(recorded_at))
+        ) / 60 AS duration_minutes -- Duration of high winds in minutes
+    FROM 
+        analytics.weather_forecast w
+        LEFT JOIN analytics.dim_facilities f 
+        ON f.facility_id = w.facility_id
+        AND f.hub_id = w.hub_id
+    WHERE 
+        wind_speed_mps >= 15 
+        AND f.facility_status NOT IN ('Obsolete', 'Deprecated', 'Inactive')
+    GROUP BY 
+        report_day, facility_name, facility_id, hub, w.hub_id
+),
+order_impact AS (
+    -- Analyze order delays and disruptions due to weather
+    SELECT 
+        o.hub_id,
+        o.facility_id,
+        DATE_TRUNC('hour', o.order_confirmed_at) AS order_hour,
+        DATE_TRUNC('hour', d.delivery_completed_at) AS delivery_hour,
+        o.order_id,
+        d.flight_id,
+        d.package_id
+    FROM 
+        analytics.orders o
+        LEFT JOIN analytics.deliveries d 
+        ON o.hub_id = d.hub_id 
+        AND o.order_id = d.order_id
+    WHERE 
+        o.facility_id IS NOT NULL
+        AND o.order_canceled_at IS NULL -- Exclude canceled orders
+    ORDER BY 
+        order_hour DESC NULLS LAST
+),
+weather_impact AS (
+    -- Identify flights, orders, and packages directly impacted by weather
+    SELECT 
+        DATE_TRUNC('day', f.flight_launched_at) AS impact_day,
+        f.hub_id,
+        f.facility_id,
+        f.flight_id,
+        f.order_id,
+        f.package_id
+    FROM 
+        analytics.flight_data f
+        LEFT JOIN analytics.weather_disruptions wd 
+        ON wd.hub_id = f.hub_id
+        AND f.flight_id = wd.flight_id
+    WHERE 
+        wd.disruption_cause = 'Weather'
+    ORDER BY 
+        impact_day DESC
+),
+total_orders AS (
+    -- Compute total orders and packages per day
+    SELECT 
+        o.hub_id,
+        DATE_TRUNC('day', o.order_confirmed_at) AS order_day,
+        COUNT(DISTINCT o.order_id) AS total_orders,
+        COUNT(DISTINCT d.package_id) AS total_packages
+    FROM 
+        analytics.orders o
+        LEFT JOIN analytics.deliveries d 
+        ON o.hub_id = d.hub_id
+        AND o.order_id = d.order_id
+    WHERE 
+        o.facility_id IS NOT NULL
+        AND o.order_canceled_at IS NULL -- Exclude canceled orders
+    GROUP BY 
+        o.hub_id, order_day
+    ORDER BY 
+        order_day DESC NULLS LAST
+)
+-- Final Query: Combine Weather, Order, and Facility Data
+SELECT 
+    DATE(wc.report_day) AS report_date,
+    h.hub_name AS hub,
+    wc.hub_id,
+    MAX(wc.max_wind_speed) AS max_wind_speed,
+    ROUND(AVG(wc.duration_minutes)) AS avg_duration_high_winds,
+    COUNT(DISTINCT wc.facility_id) AS affected_facilities,
+    COUNT(DISTINCT f.facility_id) AS total_operational_facilities,
+    COUNT(DISTINCT oi.order_id) AS affected_orders,
+    COUNT(DISTINCT oi.package_id) AS affected_packages,
+    COALESCE(to.total_orders, 0) AS total_orders,
+    COALESCE(to.total_packages, 0) AS total_packages,
+    
+    -- Calculated Fields: Ratios for Weather Impact
+    ROUND(AVG(affected_facilities) / NULLIF(AVG(total_operational_facilities), 0), 2) AS facility_disruption_ratio,
+    ROUND(SUM(affected_orders) / NULLIF(SUM(total_orders), 0), 2) AS order_disruption_ratio,
+    ROUND(SUM(affected_packages) / NULLIF(SUM(total_packages), 0), 2) AS package_disruption_ratio
+
+FROM 
+    weather_conditions wc
+    LEFT JOIN order_impact oi 
+        ON oi.order_hour = wc.report_day
+        AND oi.hub_id = wc.hub_id
+        AND wc.facility_id = oi.facility_id
+    LEFT JOIN weather_impact wi 
+        ON oi.order_id = wi.order_id
+        AND oi.hub_id = wi.hub_id
+    LEFT JOIN total_orders to 
+        ON to.hub_id = wc.hub_id
+        AND to.order_day = DATE(wc.report_day)
+    LEFT JOIN analytics.dim_facilities f 
+        ON wc.hub_id = f.hub_id
+    LEFT JOIN analytics.dim_hubs h 
+        ON h.hub_id = wc.hub_id
+WHERE 
+    f.facility_status NOT IN ('Obsolete', 'Deprecated', 'Inactive')
+    AND wc.report_day BETWEEN DATEADD('Year', -1, CURRENT_DATE()) AND CURRENT_DATE()
+GROUP BY 
+    report_date, h.hub_name, wc.hub_id, to.total_orders, to.total_packages
+HAVING 
+    ROUND(AVG(wc.duration_minutes)) > 15
+ORDER BY 
+    report_date DESC;
